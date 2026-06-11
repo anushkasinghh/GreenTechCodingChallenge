@@ -1,0 +1,312 @@
+name: Efficiency Check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  efficiency:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+
+    steps:
+      - name: Checkout student project
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build backend (cached)
+        uses: docker/build-push-action@v6
+        with:
+          context: ./Backend
+          tags: greentech-backend:latest
+          load: true
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,scope=backend,mode=max
+
+      - name: Build frontend (cached)
+        uses: docker/build-push-action@v6
+        with:
+          context: ./Frontend/my-blog
+          tags: greentech-frontend:latest
+          load: true
+          cache-from: type=gha,scope=frontend
+          cache-to: type=gha,scope=frontend,mode=max
+
+      - name: Start services
+        run: docker compose up -d
+
+      - name: Wait for backend and frontend
+        run: |
+          check() {
+            local url=$1 name=$2
+            for i in $(seq 1 30); do
+              curl -sf "$url" -o /dev/null && echo "$name ready." && return 0
+              printf '  %s attempt %d/30\n' "$name" "$i"; sleep 2
+            done
+            echo "$name did not become ready"; exit 1
+          }
+          check http://localhost:4500/api/blogs backend &
+          check http://localhost:3000           frontend &
+          wait
+
+      - name: Checkout test suite
+        uses: actions/checkout@v4
+        with:
+          repository: ElenaWerny/GreenTechEfficiencyTests
+          token: ${{ secrets.TESTS_TOKEN }}
+          path: .test-suite
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Cache test suite node_modules
+        uses: actions/cache@v4
+        with:
+          path: .test-suite/node_modules
+          key: test-deps-${{ hashFiles('.test-suite/package-lock.json') }}
+
+      - name: Cache Playwright browsers
+        id: pw-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ hashFiles('.test-suite/package-lock.json') }}
+
+      # Run API tests — always exits 0, writes /tmp/api-results.json
+      - name: Run API tests
+        run: node .test-suite/tests/api.test.mjs
+        env:
+          BACKEND_URL: http://localhost:4500
+          RESULTS_FILE: /tmp/api-results.json
+
+      # Run Terraform tests — always exits 0, writes /tmp/terraform-results.json
+      - name: Run Terraform tests
+        run: node .test-suite/tests/terraform.test.mjs
+        env:
+          PROJECT_PATH: .
+          RESULTS_FILE: /tmp/terraform-results.json
+
+      # Run AI config tests — always exits 0, writes /tmp/ai-results.json
+      - name: Run AI tests
+        run: node .test-suite/tests/ai.test.mjs
+        env:
+          PROJECT_PATH: .
+          RESULTS_FILE: /tmp/ai-results.json
+
+      # Run frontend structure tests — always exits 0, writes /tmp/frontend-results.json
+      - name: Run frontend tests
+        run: node .test-suite/tests/frontend.test.mjs
+        env:
+          PROJECT_PATH: .
+          RESULTS_FILE: /tmp/frontend-results.json
+
+      - name: Install Playwright
+        working-directory: .test-suite
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+
+      # Run browser tests — || true so step never fails; JSON reporter writes /tmp/browser-results.json
+      - name: Run browser tests
+        working-directory: .test-suite
+        run: npx playwright test || true
+        env:
+          FRONTEND_URL: http://localhost:3000
+          PAGEWEIGHT_FILE: /tmp/pageweight.json
+
+      # Combine results, post PR comment, apply 80 % threshold
+      - name: Evaluate results and post summary
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+
+            // ── Read test results by source ───────────────────────────────────
+            const readTests = (file) => {
+              try { return JSON.parse(fs.readFileSync(file, 'utf8')).tests; }
+              catch (e) { core.warning(`Results not found (${file}): ${e.message}`); return []; }
+            };
+
+            const apiTests = readTests('/tmp/api-results.json');
+            const tfTests  = readTests('/tmp/terraform-results.json');
+            const aiTests  = readTests('/tmp/ai-results.json');
+            const feTests  = readTests('/tmp/frontend-results.json');
+            const nodeTests = [...apiTests, ...tfTests, ...aiTests, ...feTests];
+
+            // ── Read page weight ──────────────────────────────────────────────
+            let pageWeightKB = null;
+            let co2Grams = null;
+            let co2Rating = null;
+            try {
+              const pw = JSON.parse(fs.readFileSync('/tmp/pageweight.json', 'utf8'));
+              pageWeightKB = pw.totalKB;
+              co2Grams = pw.co2Grams;
+              co2Rating = pw.rating;
+            } catch (e) {
+              core.warning('Page weight not found: ' + e.message);
+            }
+
+            // ── Read Playwright results ───────────────────────────────────────
+            let browserTests = [];
+            try {
+              const raw = JSON.parse(fs.readFileSync('/tmp/browser-results.json', 'utf8'));
+              function collectSpecs(suites) {
+                const specs = [];
+                for (const suite of suites ?? []) {
+                  for (const spec of suite.specs ?? []) {
+                    const title = spec.title;
+                    if (!title.startsWith('[baseline]') && !title.startsWith('[efficiency]')) continue;
+                    const status = spec.tests?.[0]?.results?.[0]?.status;
+                    const cat    = title.startsWith('[baseline]') ? 'baseline' : 'efficiency';
+                    const name   = title.replace(/^\[(baseline|efficiency)\]\s*/, '');
+                    specs.push({ name, passed: status === 'passed', category: cat });
+                  }
+                  specs.push(...collectSpecs(suite.suites));
+                }
+                return specs;
+              }
+              browserTests = collectSpecs(raw.suites);
+            } catch (e) {
+              core.warning('Browser results not found: ' + e.message);
+            }
+
+            const allTests = [...nodeTests, ...browserTests];
+
+            // ── Categorise + count ────────────────────────────────────────────
+            const baseTests = allTests.filter(t => t.category === 'baseline');
+            const effTests  = allTests.filter(t => t.category !== 'baseline');
+
+            const basePassed = baseTests.filter(t => t.passed).length;
+            const effPassed  = effTests.filter(t => t.passed).length;
+            const totPassed  = basePassed + effPassed;
+
+            const effPct    = effTests.length > 0 ? Math.round((effPassed / effTests.length) * 100) : 0;
+            const THRESHOLD = 80;
+            const passing   = effPct >= THRESHOLD;
+
+            // ── Sort + display helpers ────────────────────────────────────────
+            const byNum = arr => [...arr].sort((a, b) => {
+              const na = parseInt(a.name.replace(/\D+/g, '')) || 0;
+              const nb = parseInt(b.name.replace(/\D+/g, '')) || 0;
+              return na - nb;
+            });
+
+            const lines = ts => ts.map(t =>
+              `- ${t.passed ? '✅' : '❌'} ${t.name}` +
+              (!t.passed && t.message ? `\n  > *${t.message}*` : '')
+            ).join('\n') || '_No results_';
+
+            // Baseline: globally sequential display numbers (1, 2, 3 …)
+            let displayNum = 0;
+            const renum = arr => arr.map(t => ({ ...t, name: `test ${++displayNum}` }));
+
+            const infraBase = renum([
+              ...byNum(apiTests.filter(t => t.category === 'baseline')),
+              ...byNum(tfTests.filter(t => t.category === 'baseline')),
+              ...byNum(aiTests.filter(t => t.category === 'baseline')),
+            ]);
+            const feBase = renum(byNum(feTests.filter(t => t.category === 'baseline')));
+            const brBase = renum(byNum(browserTests.filter(t => t.category === 'baseline')));
+
+            // Efficiency: sorted per source, grouped under bold labels
+            const apiEff = byNum(apiTests.filter(t => t.category !== 'baseline'));
+            const tfEff  = byNum(tfTests.filter(t => t.category !== 'baseline'));
+            const aiEff  = byNum(aiTests.filter(t => t.category !== 'baseline'));
+            const feEff  = byNum(feTests.filter(t => t.category !== 'baseline'));
+            const brEff  = byNum(browserTests.filter(t => t.category !== 'baseline'));
+
+            const infraEffLines = [
+              apiEff.length ? '**API**\n' + lines(apiEff) : '',
+              tfEff.length  ? '**Infrastructure**\n' + lines(tfEff) : '',
+              aiEff.length  ? '**AI**\n' + lines(aiEff) : '',
+            ].filter(s => s).join('\n\n') || '_No results_';
+
+            // ── Build markdown report ─────────────────────────────────────────
+            const row = (label, p, t, required) =>
+              `| ${label} | ${p} | ${t} | ${t > 0 ? Math.round(p / t * 100) : 0}% | ${required} |`;
+
+            const badgeUrl = passing
+              ? 'https://img.shields.io/badge/Efficiency-Passed-brightgreen?style=for-the-badge'
+              : 'https://img.shields.io/badge/Efficiency-Failed-red?style=for-the-badge';
+            const badge = `![Efficiency Check](${badgeUrl})`;
+
+            const ratingColor = {
+              'A+': 'brightgreen', A: 'green', B: 'yellowgreen',
+              C: 'yellow', D: 'orange', E: 'orangered', F: 'red',
+            }[co2Rating] ?? 'lightgrey';
+            const ratingBadgeUrl = co2Rating
+              ? `https://img.shields.io/badge/Rating-${encodeURIComponent(co2Rating)}-${ratingColor}?style=for-the-badge`
+              : null;
+            const ratingBadge = ratingBadgeUrl ? `![Rating](${ratingBadgeUrl})` : '';
+
+            const pageWeightLine = pageWeightKB !== null
+              ? `Initial page weight: **${pageWeightKB} KB**\nCO₂e per visit: **${co2Grams} g**\n${ratingBadge}`
+              : '';
+            const body = [
+              `## Efficiency Check`,
+              badge,
+              '',
+              '### Overall score',
+              pageWeightLine,
+              '',
+              `| Category | Passed | Total | Score | Required |`,
+              `|---|:---:|:---:|:---:|:---:|`,
+              row('Base functionality', basePassed, baseTests.length, '100%'),
+              row('Efficiency checks',  effPassed,  effTests.length,  '80%'),
+              '',
+              passing
+                ? `**CI passes** — ${effPct}% of efficiency checks pass (threshold: ${THRESHOLD}%)`
+                : `**CI fails** — ${effPct}% of efficiency checks pass, ${THRESHOLD}% required`,
+              '',
+              '<details>',
+              '<summary>Test details</summary>',
+              '',
+              '### Base Functionality',
+              '#### API & Infrastructure',
+              lines(infraBase),
+              '',
+              '#### Frontend',
+              lines(feBase),
+              '',
+              '#### Browser',
+              lines(brBase),
+              '',
+              '### Efficiency Checks',
+              '#### API & Infrastructure',
+              infraEffLines,
+              '',
+              '#### Frontend',
+              lines(feEff),
+              '',
+              '#### Browser',
+              lines(brEff),
+              '',
+              '</details>',
+            ].join('\n');
+
+            core.info(`\nBase: ${basePassed}/${baseTests.length} | Efficiency: ${effPassed}/${effTests.length} (${effPct}%)`);
+
+            // ── Post PR comment ───────────────────────────────────────────────
+            if (context.eventName === 'pull_request') {
+              await github.rest.issues.createComment({
+                owner:        context.repo.owner,
+                repo:         context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+            // ── Fail the job if efficiency score is below threshold ───────────
+            if (!passing) {
+              core.setFailed(`${effPct}% of efficiency checks pass — ${THRESHOLD}% required to pass`);
+            }

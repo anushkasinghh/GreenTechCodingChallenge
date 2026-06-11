@@ -1,0 +1,49 @@
+services:
+  mongodb:
+    image: mongo:7
+    container_name: greentech_mongodb
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+    networks:
+      - greentech_network
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    image: greentech-backend:latest
+    build: ./Backend
+    container_name: greentech_backend
+    ports:
+      - "4500:4500"
+    environment:
+      - MONGODB_URL=mongodb://mongodb:27017/greentech
+      - PORT=4500
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    networks:
+      - greentech_network
+
+  frontend:
+    image: greentech-frontend:latest
+    build: ./Frontend/my-blog
+    container_name: greentech_frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    networks:
+      - greentech_network
+
+volumes:
+  mongodb_data:
+
+networks:
+  greentech_network:
+    driver: bridge
