@@ -3,49 +3,34 @@ import BlogEntry from '../models/BlogEntry';
 
 const router = Router();
 
-// Proxy images through the backend and embed them as base64 so the browser
-// does not need a separate cross-origin request to the image host.
-async function fetchImageAsBase64(url: string): Promise<string | null> {
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 5000);
-    const response = await fetch(url, { signal: controller.signal });
-    clearTimeout(timeout);
-    if (!response.ok) return null;
-    const buffer = await response.arrayBuffer();
-    const mimeType = response.headers.get('content-type') || 'image/jpeg';
-    const base64 = Buffer.from(buffer).toString('base64');
-    return `data:${mimeType};base64,${base64}`;
-  } catch {
-    return null;
-  }
-}
-
+// GET /api/blogs?page=1&limit=10
+// Returns a paginated list of blog entries.
+// Images are returned as URLs only — the browser fetches them directly and caches
+// them independently. Embedding images as base64 in JSON bloats each response by
+// ~1 MB per post (base64 inflates binary by 33%) and forces a sequential
+// server-side fetch of every image on every request, with no caching benefit.
 router.get('/', async (req: Request, res: Response): Promise<void> => {
   try {
     const page  = Math.max(1, parseInt(req.query.page  as string) || 1);
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit as string) || 10));
     const skip  = (page - 1) * limit;
 
+    // Run the data query and count in parallel to avoid two sequential round-trips.
     const [blogs, total] = await Promise.all([
       BlogEntry.find().sort({ createdAt: -1 }).skip(skip).limit(limit),
       BlogEntry.countDocuments(),
     ]);
 
+    // X-Total-Count lets the frontend know how many pages exist without a separate call.
     res.setHeader('X-Total-Count', String(total));
-    const blogsWithImages = await Promise.all(
-      blogs.map(async (blog) => {
-        const obj = blog.toObject();
-        const imgData = await fetchImageAsBase64(blog.img);
-        return imgData ? { ...obj, imgData } : obj;
-      }),
-    );
-    res.json(blogsWithImages);
+    res.json(blogs.map(b => b.toObject()));
   } catch {
     res.status(500).json({ error: 'Failed to fetch blog entries' });
   }
 });
 
+// GET /api/blogs/:id
+// Returns a single blog entry by ID. Image URL is passed through as-is.
 router.get('/:id', async (req: Request, res: Response): Promise<void> => {
   try {
     const blog = await BlogEntry.findById(req.params.id);
@@ -53,9 +38,7 @@ router.get('/:id', async (req: Request, res: Response): Promise<void> => {
       res.status(404).json({ error: 'Blog entry not found' });
       return;
     }
-    const obj = blog.toObject();
-    const imgData = await fetchImageAsBase64(blog.img);
-    res.json(imgData ? { ...obj, imgData } : obj);
+    res.json(blog.toObject());
   } catch {
     res.status(500).json({ error: 'Failed to fetch blog entry' });
   }
